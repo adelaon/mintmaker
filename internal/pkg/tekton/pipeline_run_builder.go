@@ -23,6 +23,7 @@ import (
 	"unicode"
 
 	"github.com/hashicorp/go-multierror"
+	"github.com/konflux-ci/mintmaker/internal/pkg/config"
 	. "github.com/konflux-ci/mintmaker/internal/pkg/constant"
 	"github.com/konflux-ci/mintmaker/internal/pkg/utils"
 	tektonv1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
@@ -146,14 +147,25 @@ func NewPipelineRunBuilder(name, namespace string) *PipelineRunBuilder {
 										{
 											Name:  "prepare-rpm-cert",
 											Image: "registry.access.redhat.com/ubi9",
-											Script: "[ ! -f \"/etc/renovate/secret/rpm-activationkey\" ] && echo 'RPM secret not found. Exiting.' && exit 0;" +
-												"echo 'Generating RPM certificate and copying it to shared workspace';" +
-												"KEY_NAME=$(cat /etc/renovate/secret/rpm-activationkey);" +
-												"ORG_ID=$(cat /etc/renovate/secret/rpm-org);" +
-												"subscription-manager register --activationkey=\"$KEY_NAME\" --org=\"$ORG_ID\";" +
-												"mkdir -p /workspace/shared-data/rpm-certs;" +
-												"cp /etc/pki/entitlement/*-key.pem /workspace/shared-data/rpm-certs/key.pem;" +
-												"cp $(find /etc/pki/entitlement -maxdepth 1 -type f -name '*.pem' ! -name '*-key.pem' -print -quit) /workspace/shared-data/rpm-certs/cert.pem",
+											Script: `
+												if [ ! -f "/etc/renovate/secret/rpm-activationkey" ]; then
+													echo 'RPM secret not found. Exiting with success (0).'
+													exit 0
+												fi
+												
+												echo 'Generating RPM certificate and copying it to shared workspace'
+												
+												KEY_NAME=$$(cat /etc/renovate/secret/rpm-activationkey)
+												ORG_ID=$$(cat /etc/renovate/secret/rpm-org)
+												
+												subscription-manager register --activationkey="$$KEY_NAME" --org="$$ORG_ID"
+												
+												mkdir -p /workspace/shared-data/rpm-certs
+												
+												cp /etc/pki/entitlement/*-key.pem /workspace/shared-data/rpm-certs/key.pem
+												
+												cp $$(find /etc/pki/entitlement -maxdepth 1 -type f -name '*.pem' ! -name '*-key.pem' -print -quit) /workspace/shared-data/rpm-certs/cert.pem
+											`,
 											SecurityContext: &corev1.SecurityContext{
 												Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 												AllowPrivilegeEscalation: ptr.To(false),
@@ -161,9 +173,14 @@ func NewPipelineRunBuilder(name, namespace string) *PipelineRunBuilder {
 											},
 										},
 										{
-											Name:   "renovate",
-											Image:  renovateImageURL,
-											Script: `RENOVATE_TOKEN=$(cat /etc/renovate/secret/renovate-token) RENOVATE_CONFIG_FILE=/etc/renovate/config/config.js renovate`,
+											Name:  "renovate",
+											Image: renovateImageURL,
+											Script: ` 
+												RENOVATE_TOKEN=$(cat /etc/renovate/secret/renovate-token) \
+												RENOVATE_CONFIG_FILE=/etc/renovate/config/config.js \
+												renovate; exit $${PIPESTATUS[0]}
+												`,
+											OnError: "continue",
 											SecurityContext: &corev1.SecurityContext{
 												Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 												RunAsNonRoot:             ptr.To(true),
@@ -194,6 +211,10 @@ func NewPipelineRunBuilder(name, namespace string) *PipelineRunBuilder {
 													Value: "json",
 												},
 												{
+													Name:  "LOG_FILE",
+													Value: "/workspace/shared-data/renovate-logs.json",
+												},
+												{
 													Name:  "OSV_OFFLINE_DISABLE_DOWNLOAD",
 													Value: "true",
 												},
@@ -208,6 +229,43 @@ func NewPipelineRunBuilder(name, namespace string) *PipelineRunBuilder {
 												{
 													Name:  "DNF_VAR_SSL_CLIENT_CERT",
 													Value: "/workspace/shared-data/rpm-certs/cert.pem",
+												},
+											},
+										},
+										{ // Run even if step-renovate fails
+											Name:   "log-analyzer",
+											Image:  "quay.io/konflux-ci/renovate-log-analyzer:latest",
+											Script: "",
+											SecurityContext: &corev1.SecurityContext{
+												Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+												RunAsNonRoot:             ptr.To(true),
+												RunAsUser:                &normalUser,
+												AllowPrivilegeEscalation: ptr.To(false),
+											},
+											Env: []corev1.EnvVar{
+												{
+													Name: "POD_NAME",
+													ValueFrom: &corev1.EnvVarSource{
+														FieldRef: &corev1.ObjectFieldSelector{
+															FieldPath: "metadata.name",
+														},
+													},
+												},
+												{
+													Name: "NAMESPACE",
+													ValueFrom: &corev1.EnvVarSource{
+														FieldRef: &corev1.ObjectFieldSelector{
+															FieldPath: "metadata.namespace",
+														},
+													},
+												},
+												{
+													Name:  "KITE_API_URL",
+													Value: getKiteAPIURL(config.GetConfig()), // Use config with fallback
+												},
+												{
+													Name:  "LOG_FILE",
+													Value: "/workspace/shared-data/renovate-logs.json",
 												},
 											},
 										},
@@ -454,4 +512,11 @@ func (b *PipelineRunBuilder) WithTimeouts(timeouts *tektonv1.TimeoutFields) *Pip
 		b.pipelineRun.Spec.Timeouts = timeouts
 	}
 	return b
+}
+
+func getKiteAPIURL(config *config.ControllerConfig) string {
+	if config != nil && config.GlobalConfig.KiteAPIURL != "" {
+		return config.GlobalConfig.KiteAPIURL
+	}
+	return "" // Will cause error if not set, which is good
 }
