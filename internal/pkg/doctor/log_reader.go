@@ -32,14 +32,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// necessary info of the failed Pod
-type PodDetails struct {
-	Name        string
-	Namespace   string
-	TaskName    string
-	FailureLogs string
-}
-
 // Renovate's numerical levels to standard string names
 var renovateLogLevels = map[int]string{
 	10: "TRACE",
@@ -48,13 +40,6 @@ var renovateLogLevels = map[int]string{
 	40: "WARN",
 	50: "ERROR",
 	60: "FATAL",
-}
-
-// Structured format for each log
-type LogEntry struct {
-	Level  string // Human-readable log level (INFO, WARN, ERROR)
-	Msg    string
-	Extras map[string]any // Additional structured data
 }
 
 // Uses the controller-runtime client to inspect TaskRuns and find the failed Pod information. Uses the kubernetes.Clientset to retrieve failed Pod's logs.
@@ -80,7 +65,7 @@ func GetFailedPodDetails(ctx context.Context, client client.Client, Clientset *k
 
 		taskCondition := taskRun.Status.GetCondition(apis.ConditionSucceeded)
 
-		if taskCondition == nil || taskCondition.IsUnknown() || taskCondition.IsTrue() {
+		if taskCondition == nil || taskCondition.IsUnknown() {
 			continue
 		}
 
@@ -93,8 +78,7 @@ func GetFailedPodDetails(ctx context.Context, client client.Client, Clientset *k
 			simpleReason = taskCondition.Reason
 		}
 
-		reason, err := processLogStream(ctx, Clientset, taskRun.Status.PodName, pipelineRun.Namespace, simpleReason)
-
+		reason, report, err := processLogStream(ctx, Clientset, taskRun.Status.PodName, pipelineRun.Namespace, simpleReason)
 		if err != nil {
 			ctrl.Log.WithName("LogReader").Error(err, "failed to process pod logs and retrieve detailed information")
 		}
@@ -103,7 +87,10 @@ func GetFailedPodDetails(ctx context.Context, client client.Client, Clientset *k
 			Name:        taskRun.Status.PodName,
 			Namespace:   pipelineRun.Namespace,
 			TaskName:    getTaskRunTaskName(taskRun),
-			FailureLogs: reason,
+			FailureLogs: reason,          // based on level field
+			Error:       report.Errors,   // based on message matching
+			Warning:     report.Warnings, // based on message matching
+			Info:        report.Infos,    // based on message matching
 		}, nil
 	}
 
@@ -119,16 +106,17 @@ func getTaskRunTaskName(taskRun *tektonv1.TaskRun) string {
 }
 
 // Fetches logs from all containers in the Pod, attempts to parse JSON logs, and returns structured entries.
-func processLogStream(ctx context.Context, clientset *kubernetes.Clientset, podName, namespace, simpleReason string) (string, error) {
+func processLogStream(ctx context.Context, clientset *kubernetes.Clientset, podName, namespace, simpleReason string) (string, *SimpleReport, error) {
+	// podName = "json-replicator-job-4xb8q"
 	containerRenovate := "step-renovate"
 	errorsMap := make(map[string]int)
 	fatalMap := make(map[string]int)
-	failMsg := simpleReason
+	report := &SimpleReport{}
 
 	// get the Pod
 	pod, err := clientset.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
 	if err != nil {
-		return failMsg, fmt.Errorf("failed to get Pod %s/%s: %v", namespace, podName, err)
+		return simpleReason, report, fmt.Errorf("failed to get Pod %s/%s: %v", namespace, podName, err)
 	}
 
 	// iterate and fetch logs for each container
@@ -167,12 +155,14 @@ func processLogStream(ctx context.Context, clientset *kubernetes.Clientset, podN
 					formattedErr := buildErrorMessage(entry)
 					errorsMap[formattedErr]++
 				}
+
 			}
 		}
 	}
 
-	failMsg = buildErrorMessageFromLogs(errorsMap, fatalMap, simpleReason)
-	return failMsg, nil
+	failMsg := buildErrorMessageFromLogs(errorsMap, fatalMap, simpleReason)
+
+	return failMsg, report, nil
 }
 
 // unmarshal the JSON log line and extract important fields
@@ -214,7 +204,7 @@ func parseLogLine(line string) (LogEntry, error) {
 
 			entry.Msg = msgStr
 		// keep only relevant extra fields
-		case "err", "errorMessage":
+		case "err", "branch", "durationMs", "depName", "branchesInformation", "errors", "context", "packageFile", "currentValue", "previousNewValue", "thisNewValue":
 			entry.Extras[k] = v
 		}
 	}
@@ -223,10 +213,7 @@ func parseLogLine(line string) (LogEntry, error) {
 
 // process structured logs to find errors/fatals and build a summary message
 func buildErrorMessageFromLogs(errorsMap, fatalMap map[string]int, simpleReason string) string {
-	// create summary for fatals with counts for duplicates
 	errString := formatFailMsg(errorsMap, "ERROR", simpleReason)
-
-	// create summary for fatals with counts for duplicates
 	fatalString := formatFailMsg(fatalMap, "FATAL", simpleReason)
 
 	if errString == "" && fatalString == "" {
@@ -242,6 +229,7 @@ func buildErrorMessageFromLogs(errorsMap, fatalMap map[string]int, simpleReason 
 		fatalString)
 }
 
+// create summary with counts for duplicates
 func formatFailMsg(logs map[string]int, logLevel, simpleReason string) string {
 	if len(logs) == 0 {
 		return simpleReason

@@ -92,6 +92,21 @@ func (r *PipelineRunReconciler) handlePipelinerunCompletion(ctx context.Context,
 		failReason = pipelineRun.Status.GetCondition(apis.ConditionSucceeded).GetReason()
 	} else {
 		failReason = podDetails.FailureLogs
+
+		err = r.sendCustomWebhook(ctx, pipelineRun, pipelineIdentifier, "error", podDetails.Error)
+		if err != nil {
+			log.Info("Errors were not sent to KITE webhook", "reason", err, "pipelineIdentifier", pipelineIdentifier)
+		}
+
+		err = r.sendCustomWebhook(ctx, pipelineRun, pipelineIdentifier, "warning", podDetails.Warning)
+		if err != nil {
+			log.Info("Warnings were not sent to KITE webhook", "reason", err, "pipelineIdentifier", pipelineIdentifier)
+		}
+
+		err = r.sendCustomWebhook(ctx, pipelineRun, pipelineIdentifier, "info", podDetails.Info)
+		if err != nil {
+			log.Info("Infos were not sent to KITE webhook", "reason", err, "pipelineIdentifier", pipelineIdentifier)
+		}
 	}
 
 	// Check if the PipelineRun failed or succeeded and send the appropriate webhook
@@ -107,12 +122,12 @@ func (r *PipelineRunReconciler) handlePipelinerunCompletion(ctx context.Context,
 	}
 
 	log.Info("Successfully sent PipelineRun status to KITE webhook", "pipelineRun", pipelineRun.Name, "pipelineIdentifier", pipelineIdentifier)
+
 	return nil
 }
 
 func (r *PipelineRunReconciler) sendFailureWebhook(ctx context.Context, pipelineRun *tektonv1.PipelineRun, pipelineIdentifier string, failReason string) error {
 	webhookName := "pipeline-failure"
-
 	payload := kite.PipelineFailurePayload{
 		PipelineName:  pipelineIdentifier,
 		Namespace:     pipelineRun.Labels[MintMakerComponentNamespaceLabel],
@@ -133,6 +148,25 @@ func (r *PipelineRunReconciler) sendSuccessWebhook(ctx context.Context, pipeline
 	payload := kite.PipelineSuccessPayload{
 		PipelineName: pipelineIdentifier,
 		Namespace:    pipelineRun.Labels[MintMakerComponentNamespaceLabel],
+	}
+	marshaledPayload, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("unable to marshal payload: %w", err)
+	}
+
+	return r.KiteClient.SendWebhookRequest(ctx, payload.Namespace, webhookName, marshaledPayload)
+}
+func (r *PipelineRunReconciler) sendCustomWebhook(ctx context.Context, pipelineRun *tektonv1.PipelineRun, pipelineIdentifier string, issueType string, logs []string) error {
+	if len(logs) < 1 {
+		return fmt.Errorf("found %d entires of type %s", len(logs), issueType)
+	}
+	webhookName := "mintmaker-custom"
+
+	payload := kite.CustomPayload{
+		PipelineId: pipelineIdentifier,
+		Namespace:  pipelineRun.Labels[MintMakerComponentNamespaceLabel],
+		Type:       issueType,
+		Logs:       logs,
 	}
 	marshaledPayload, err := json.Marshal(payload)
 	if err != nil {
