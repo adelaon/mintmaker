@@ -47,11 +47,11 @@ var (
 
 // PipelineRunReconciler reconciles a PipelineRun object
 type PipelineRunReconciler struct {
-	Client       client.Client
-	K8sClientset *kubernetes.Clientset
-	Scheme       *runtime.Scheme
-	Config       *config.ControllerConfig
-	KiteClient   *kite.Client
+	Client     client.Client
+	Clientset  *kubernetes.Clientset
+	Scheme     *runtime.Scheme
+	Config     *config.ControllerConfig
+	KiteClient *kite.Client
 }
 
 func (r *PipelineRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -85,7 +85,7 @@ func (r *PipelineRunReconciler) handlePipelinerunCompletion(ctx context.Context,
 	// Construct a unique pipeline identifier using the Git URL and revision (branch)
 	pipelineIdentifier := fmt.Sprintf("%s/%s", component.Spec.Source.GitSource.URL, component.Spec.Source.GitSource.Revision)
 
-	podDetails, err := doctor.GetFailedPodDetails(ctx, r.Client, r.K8sClientset, pipelineRun)
+	podDetails, err := doctor.GetFailedPodDetails(ctx, r.Client, r.Clientset, pipelineRun)
 	var failReason string
 	if err != nil {
 		log.Error(err, "Failed to get failed Pod details", "pipelineRun", pipelineRun.Name)

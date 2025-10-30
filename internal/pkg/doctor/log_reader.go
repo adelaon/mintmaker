@@ -20,7 +20,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -53,16 +52,13 @@ var renovateLogLevels = map[int]string{
 
 // Structured format for each log
 type LogEntry struct {
-	Timestamp time.Time
-	Level     string // Human-readable log level (INFO, WARN, ERROR)
-	Message   string
-	Container string
-	Pod       string
-	Extras    map[string]any // Additional structured data
+	Level  string // Human-readable log level (INFO, WARN, ERROR)
+	Msg    string
+	Extras map[string]any // Additional structured data
 }
 
 // Uses the controller-runtime client to inspect TaskRuns and find the failed Pod information. Uses the kubernetes.Clientset to retrieve failed Pod's logs.
-func GetFailedPodDetails(ctx context.Context, client client.Client, k8sClientset *kubernetes.Clientset, pipelineRun *tektonv1.PipelineRun) (*PodDetails, error) {
+func GetFailedPodDetails(ctx context.Context, client client.Client, Clientset *kubernetes.Clientset, pipelineRun *tektonv1.PipelineRun) (*PodDetails, error) {
 	if pipelineRun.Status.ChildReferences == nil {
 		return nil, fmt.Errorf("pipelineRun has no child references or status is incomplete")
 	}
@@ -92,13 +88,15 @@ func GetFailedPodDetails(ctx context.Context, client client.Client, k8sClientset
 			continue
 		}
 
-		structuredLogs, err := processLogStream(ctx, k8sClientset, taskRun.Status.PodName, pipelineRun.Namespace)
-		var reason string
+		simpleReason := ""
+		if !taskCondition.IsTrue() {
+			simpleReason = taskCondition.Reason
+		}
+
+		reason, err := processLogStream(ctx, Clientset, taskRun.Status.PodName, pipelineRun.Namespace, simpleReason)
+
 		if err != nil {
-			ctrl.Log.WithName("LogReader").Error(err, "failed to process failed pod logs and retrieve detailed error messages")
-			reason = taskCondition.Reason
-		} else {
-			reason = checkLogs(structuredLogs, taskCondition.Reason)
+			ctrl.Log.WithName("LogReader").Error(err, "failed to process pod logs and retrieve detailed information")
 		}
 
 		return &PodDetails{
@@ -109,7 +107,7 @@ func GetFailedPodDetails(ctx context.Context, client client.Client, k8sClientset
 		}, nil
 	}
 
-	return nil, fmt.Errorf("no failed TaskRun found with a valid PodName")
+	return nil, fmt.Errorf("no TaskRun found with a valid PodName")
 }
 
 // helper function to safely retrieve task name
@@ -121,17 +119,23 @@ func getTaskRunTaskName(taskRun *tektonv1.TaskRun) string {
 }
 
 // Fetches logs from all containers in the Pod, attempts to parse JSON logs, and returns structured entries.
-func processLogStream(ctx context.Context, clientset *kubernetes.Clientset, podName, namespace string) ([]LogEntry, error) {
-	var structuredLogs []LogEntry
+func processLogStream(ctx context.Context, clientset *kubernetes.Clientset, podName, namespace, simpleReason string) (string, error) {
+	containerRenovate := "step-renovate"
+	errorsMap := make(map[string]int)
+	fatalMap := make(map[string]int)
+	failMsg := simpleReason
 
 	// get the Pod
 	pod, err := clientset.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("failed to get Pod %s/%s: %v", namespace, podName, err)
+		return failMsg, fmt.Errorf("failed to get Pod %s/%s: %v", namespace, podName, err)
 	}
 
 	// iterate and fetch logs for each container
 	for _, container := range pod.Spec.Containers {
+		if container.Name != containerRenovate {
+			continue
+		}
 		logOptions := &corev1.PodLogOptions{
 			Container: container.Name,
 		}
@@ -142,40 +146,37 @@ func processLogStream(ctx context.Context, clientset *kubernetes.Clientset, podN
 		if streamErr != nil {
 			continue
 		}
+		defer podLogs.Close()
 
 		// read the stream line by line
+		const maxBufferSize = 1 * 1024 * 1024 // bigger logs may need larger buffer
 		scanner := bufio.NewScanner(podLogs)
+		buf := make([]byte, maxBufferSize)
+		scanner.Buffer(buf, maxBufferSize)
 		for scanner.Scan() {
-			line := scanner.Text()
+			line := string(scanner.Bytes())
 
 			// attempt to parse the JSON log line
-			entry, err := parseLogLine(line, container.Name, podName)
-			if err != nil {
-				// log the non-JSON line as an UNKNOWN entry (only step-renovate has JSON logs)
-				entry = LogEntry{
-					Timestamp: time.Now(),
-					Level:     "UNKNOWN",
-					Message:   line,
-					Container: container.Name,
-					Pod:       podName,
+			entry, err := parseLogLine(line)
+			if err == nil {
+				switch entry.Level {
+				case "FATAL":
+					formattedErr := buildErrorMessage(entry)
+					fatalMap[formattedErr]++
+				case "ERROR":
+					formattedErr := buildErrorMessage(entry)
+					errorsMap[formattedErr]++
 				}
 			}
-
-			// append the structured entry
-			structuredLogs = append(structuredLogs, entry)
 		}
-		podLogs.Close()
 	}
 
-	if len(structuredLogs) == 0 {
-		return nil, fmt.Errorf("failed to read logs for pod %s/%s (checked %d containers)", namespace, podName, len(pod.Spec.Containers))
-	}
-
-	return structuredLogs, nil
+	failMsg = buildErrorMessageFromLogs(errorsMap, fatalMap, simpleReason)
+	return failMsg, nil
 }
 
 // unmarshal the JSON log line and extract important fields
-func parseLogLine(line, container, pod string) (LogEntry, error) {
+func parseLogLine(line string) (LogEntry, error) {
 
 	var rawData map[string]any
 	if err := json.Unmarshal([]byte(line), &rawData); err != nil {
@@ -184,54 +185,36 @@ func parseLogLine(line, container, pod string) (LogEntry, error) {
 
 	// assign known fields to the final structure
 	entry := LogEntry{
-		Container: container,
-		Pod:       pod,
-		Extras:    make(map[string]any),
+		Extras: make(map[string]any),
 	}
 
 	// extract standard fields, converting types as needed
 	for k, v := range rawData {
 		switch k {
-		case "time":
-			tsStr, ok := v.(string)
-			if !ok {
-				entry.Extras["time"] = v
-				continue
-			}
-
-			ts, err := time.Parse(time.RFC3339, tsStr)
-			if err != nil {
-				entry.Extras["time"] = tsStr
-				continue
-			}
-
-			entry.Timestamp = ts
+		// extract known Renovate log levels
 		case "level":
 			levelFloat, ok := v.(float64)
 			if !ok {
-				entry.Extras["level"] = v
 				continue
 			}
 
 			levelInt := int(levelFloat)
 			levelStr, found := renovateLogLevels[levelInt]
 			if !found {
-				entry.Level = fmt.Sprintf("LEVEL_%d", levelInt)
 				continue
 			}
 
 			entry.Level = levelStr
+		// keep a valid string log message
 		case "msg":
 			msgStr, ok := v.(string)
 			if !ok {
-				entry.Extras["msg"] = v
 				continue
 			}
 
-			entry.Message = msgStr
-		case "name", "hostname", "pid", "logContext", "v":
-			entry.Extras[k] = v
-		default:
+			entry.Msg = msgStr
+		// keep only relevant extra fields
+		case "err", "errorMessage":
 			entry.Extras[k] = v
 		}
 	}
@@ -239,83 +222,50 @@ func parseLogLine(line, container, pod string) (LogEntry, error) {
 }
 
 // process structured logs to find errors/fatals and build a summary message
-func checkLogs(logs []LogEntry, simpleReason string) string {
-	errorsMap := make(map[string]int)
-	fatalMap := make(map[string]int)
-
-	// look only for ERROR and FATAL levels (which are the immediate cause of exit with non-zero code)
-	// more detailed info will be shared through custom webhooks
-	// iterate in reverse to get the most recent errors first
-	for i := len(logs) - 1; i >= 0; i-- {
-		logEntry := logs[i]
-		switch logEntry.Level {
-		case "FATAL":
-			formattedErr := buildErrorMessage(logEntry)
-			fatalMap[formattedErr]++
-		case "ERROR":
-			formattedErr := buildErrorMessage(logEntry)
-			errorsMap[formattedErr]++
-		}
-	}
+func buildErrorMessageFromLogs(errorsMap, fatalMap map[string]int, simpleReason string) string {
+	// create summary for fatals with counts for duplicates
+	errString := formatFailMsg(errorsMap, "ERROR", simpleReason)
 
 	// create summary for fatals with counts for duplicates
-	errString := func(errors map[string]int) string {
-		if len(errors) == 0 {
-			return ""
-		}
-
-		totalCount := 0
-		var uniqueMessages []string
-
-		for msg, count := range errors {
-			totalCount += count
-
-			if count > 1 {
-				uniqueMessages = append(uniqueMessages, fmt.Sprintf("%dx %s", count, msg))
-			} else {
-				uniqueMessages = append(uniqueMessages, msg)
-			}
-		}
-
-		return fmt.Sprintf("%d ERROR:\n%s", totalCount, strings.Join(uniqueMessages, ""))
-	}(errorsMap)
-
-	// create summary for fatals with counts for duplicates
-	fatalString := func(fatal map[string]int) string {
-		if len(fatal) == 0 {
-			return ""
-		}
-
-		totalCount := 0
-		var uniqueMessages []string
-
-		for msg, count := range fatal {
-			totalCount += count
-
-			if count > 1 {
-				uniqueMessages = append(uniqueMessages, fmt.Sprintf("%dx %s", count, msg))
-			} else {
-				uniqueMessages = append(uniqueMessages, msg)
-			}
-		}
-
-		return fmt.Sprintf("%d FATAL:\n%s", totalCount, strings.Join(uniqueMessages, ""))
-	}(fatalMap)
+	fatalString := formatFailMsg(fatalMap, "FATAL", simpleReason)
 
 	if errString == "" && fatalString == "" {
 		errString = fmt.Sprintf("reason: %s", simpleReason)
 	}
 
-	container := logs[len(logs)-1].Container
-	return fmt.Sprintf("Container %s exited with \n%s %s",
-		container,
+	if errString == fatalString {
+		fatalString = ""
+	}
+
+	return fmt.Sprintf("Mintmaker failed with \n%s %s",
 		errString,
 		fatalString)
 }
 
+func formatFailMsg(logs map[string]int, logLevel, simpleReason string) string {
+	if len(logs) == 0 {
+		return simpleReason
+	}
+
+	totalCount := 0
+	var uniqueMessages []string
+
+	for msg, count := range logs {
+		totalCount += count
+
+		if count > 1 {
+			uniqueMessages = append(uniqueMessages, fmt.Sprintf("%dx %s", count, msg))
+		} else {
+			uniqueMessages = append(uniqueMessages, msg)
+		}
+	}
+
+	return fmt.Sprintf("%d %s:\n%s", totalCount, logLevel, strings.Join(uniqueMessages, ""))
+}
+
 // build a single error message from a log entry, including nested error details if available
 func buildErrorMessage(logEntry LogEntry) string {
-	errMsg := logEntry.Message
+	errMsg := logEntry.Msg
 
 	// Try to get additional error details
 	if errMap, ok := logEntry.Extras["err"].(map[string]any); ok {
