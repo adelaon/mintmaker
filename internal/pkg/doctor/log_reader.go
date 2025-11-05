@@ -48,6 +48,8 @@ func GetFailedPodDetails(ctx context.Context, client client.Client, Clientset *k
 		return nil, fmt.Errorf("pipelineRun has no child references or status is incomplete")
 	}
 
+	var err error
+
 	for _, childRef := range pipelineRun.Status.ChildReferences {
 		if childRef.Kind != "TaskRun" || childRef.APIVersion != tektonv1.SchemeGroupVersion.String() {
 			continue
@@ -59,7 +61,7 @@ func GetFailedPodDetails(ctx context.Context, client client.Client, Clientset *k
 			Name:      childRef.Name,
 		}
 
-		if err := client.Get(ctx, taskRunKey, taskRun); err != nil {
+		if err = client.Get(ctx, taskRunKey, taskRun); err != nil {
 			continue
 		}
 
@@ -94,7 +96,7 @@ func GetFailedPodDetails(ctx context.Context, client client.Client, Clientset *k
 		}, nil
 	}
 
-	return nil, fmt.Errorf("no TaskRun found with a valid PodName")
+	return nil, fmt.Errorf("no TaskRun found with a valid PodName: %v", err)
 }
 
 // helper function to safely retrieve task name
@@ -107,7 +109,6 @@ func getTaskRunTaskName(taskRun *tektonv1.TaskRun) string {
 
 // Fetches logs from all containers in the Pod, attempts to parse JSON logs, and returns structured entries.
 func processLogStream(ctx context.Context, clientset *kubernetes.Clientset, podName, namespace, simpleReason string) (string, *SimpleReport, error) {
-	// podName = "json-replicator-job-4xb8q"
 	containerRenovate := "step-renovate"
 	errorsMap := make(map[string]int)
 	fatalMap := make(map[string]int)
@@ -156,6 +157,11 @@ func processLogStream(ctx context.Context, clientset *kubernetes.Clientset, podN
 					errorsMap[formattedErr]++
 				}
 
+				for selector, checkFunc := range Selectors {
+					if strings.Contains(entry.Msg, selector) {
+						checkFunc(&entry, report)
+					}
+				}
 			}
 		}
 	}
@@ -204,7 +210,7 @@ func parseLogLine(line string) (LogEntry, error) {
 
 			entry.Msg = msgStr
 		// keep only relevant extra fields
-		case "err", "branch", "durationMs", "depName", "branchesInformation", "errors", "context", "packageFile", "currentValue", "previousNewValue", "thisNewValue":
+		case "err", "branch", "durationMs", "depName", "branchesInformation", "errors", "context", "packageFile", "currentValue", "previousNewValue", "thisNewValue", "oldConfig", "newConfig":
 			entry.Extras[k] = v
 		}
 	}
@@ -213,15 +219,12 @@ func parseLogLine(line string) (LogEntry, error) {
 
 // process structured logs to find errors/fatals and build a summary message
 func buildErrorMessageFromLogs(errorsMap, fatalMap map[string]int, simpleReason string) string {
-	errString := formatFailMsg(errorsMap, "ERROR", simpleReason)
-	fatalString := formatFailMsg(fatalMap, "FATAL", simpleReason)
+	errString := formatFailMsg(errorsMap, "ERROR")
+	fatalString := formatFailMsg(fatalMap, "FATAL")
 
 	if errString == "" && fatalString == "" {
-		errString = fmt.Sprintf("reason: %s", simpleReason)
-	}
-
-	if errString == fatalString {
-		fatalString = ""
+		return fmt.Sprintf("Mintmaker step-renovate finished with reason: %s",
+			simpleReason)
 	}
 
 	return fmt.Sprintf("Mintmaker failed with \n%s %s",
@@ -230,9 +233,9 @@ func buildErrorMessageFromLogs(errorsMap, fatalMap map[string]int, simpleReason 
 }
 
 // create summary with counts for duplicates
-func formatFailMsg(logs map[string]int, logLevel, simpleReason string) string {
+func formatFailMsg(logs map[string]int, logLevel string) string {
 	if len(logs) == 0 {
-		return simpleReason
+		return ""
 	}
 
 	totalCount := 0

@@ -3,6 +3,7 @@ package doctor
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -13,6 +14,9 @@ func (r *SimpleReport) Error(msg string, fields ...interface{}) {
 
 func (r *SimpleReport) Warning(msg string, fields ...interface{}) {
 	formatted := formatSimpleMessage(msg, fields)
+	if slices.Contains(r.Warnings, formatted) {
+		return
+	}
 	r.Warnings = append(r.Warnings, formatted)
 }
 
@@ -33,7 +37,7 @@ func formatSimpleMessage(msg string, fields []interface{}) string {
 		if i+1 < len(fields) {
 			key := fmt.Sprintf("%v", fields[i])
 			value := fields[i+1]
-			if key == "message" {
+			if key == "Message" {
 				result.WriteString(fmt.Sprintf("\n%s: %v\n", key, value))
 			} else {
 				result.WriteString(fmt.Sprintf(" | %s: %v", key, value))
@@ -43,20 +47,4 @@ func formatSimpleMessage(msg string, fields []interface{}) string {
 	}
 
 	return result.String()
-}
-
-// ProcessLogsWithMessageChecks - much simpler version
-func ProcessLogsWithMessageChecks(logs []LogEntry) ([]string, []string, []string, error) {
-	report := &SimpleReport{}
-
-	// Process each log entry through the registered checks
-	for _, logEntry := range logs {
-		for selector, checkFunc := range Selectors {
-			if strings.Contains(logEntry.Msg, selector) {
-				checkFunc(&logEntry, report)
-			}
-		}
-	}
-
-	return report.Errors, report.Warnings, report.Infos, nil
 }

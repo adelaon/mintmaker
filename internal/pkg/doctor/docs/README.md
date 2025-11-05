@@ -1,4 +1,5 @@
-# Go Implementation of Doctor Checks
+# Log Doctor Checks
+<small>*Original content drafted by Cursor was reviewed and edited*</small>
 
 This directory contains a Go implementation for analyzing Renovate logs and extracting categorized errors, warnings, and info messages. The implementation provides both level-based error extraction and message-based pattern matching for Kubernetes pod logs.
 
@@ -15,10 +16,10 @@ This directory contains a Go implementation for analyzing Renovate logs and extr
 
 The implementation provides two complementary approaches for log analysis:
 
-1. **Level-based extraction**: Extracts ERROR and FATAL messages based on log level for `FailureLogs`
-2. **Message-based extraction**: Uses pattern matching to categorize messages into errors, warnings, and info
+1. **Level-based extraction**: Extracts ERROR and FATAL messages based on log level for `FailureLogs` (used only in the case of a failed PipelineRun)
+2. **Message-based extraction**: Uses pattern matching to categorize messages into errors, warnings, and info (used always)
 
-### Selector Pattern
+### Selector Pattern - main logic taken from [mintmaker-e2e logdoc checks](https://gitlab.cee.redhat.com/rsaar/mintmaker-e2e/-/tree/main/tools?ref_type=heads)
 
 The message-based approach uses selector pattern matching:
 
@@ -37,7 +38,7 @@ func baseBranchDoesNotExist(line *LogEntry, report *SimpleReport) {
 
 ### Simple Report System
 
-The implementation uses a simplified report system:
+The implementation uses a simplifie report system:
 
 ```go
 type SimpleReport struct {
@@ -71,19 +72,20 @@ func GetFailedPodDetails(ctx context.Context, client client.Client, Clientset *k
 
 ## Selector List
 
-All selectors from the Python version are implemented:
+All selectors from the [mintmaker-e2e logdoc checks](https://gitlab.cee.redhat.com/rsaar/mintmaker-e2e/-/tree/main/tools?ref_type=heads) are implemented with some changes:
 
-1. `"Base branch does not exist - skipping"` - Error
-2. `"Config migration necessary"` - Warning
-3. `"Found renovate config errors"` - Error
-4. `"branches info extended"` - Info
-5. `"PR rebase requested="` - Info
-6. `"rawExec err"` - Error
-7. `"Ignoring upgrade collision"` - Warning
-8. `"Platform-native commit: unknown error"` - Error
-9. `"File contents are invalid JSONC but parse using JSON5"` - Error
-10. `"Repository has changed during renovation - aborting"` - Error
-11. `"Passing repository-changed error up"` - Error
+1. `"Reached PR limit - skipping PR creation"` - Warning
+2. `"Base branch does not exist - skipping"` - Error
+3. `"Config migration necessary"` - Warning
+4. `"Found renovate config errors"` - Error
+5. `"branches info extended"` - Info
+6. `"PR rebase requested=true"` - Info
+7. `"rawExec err"` - Error
+8. `"Ignoring upgrade collision"` - Warning
+9. `"Platform-native commit: unknown error"` - Error
+10. `"File contents are invalid JSONC but parse using JSON5"` - Error
+11. `"Repository has changed during renovation - aborting"` - Error
+12. `"Passing repository-changed error up"` - Error
 
 ## Log Levels
 
@@ -96,15 +98,42 @@ Following [Renovate documentation](https://docs.renovatebot.com/troubleshooting/
 - **ERROR**: 50
 - **FATAL**: 60
 
-## Key Features
+## ExtractUsefulError Function
 
-- **Dual Processing**: Both level-based and message-based log analysis
-- **Kubernetes Integration**: Direct log extraction from failed pods using Kubernetes clientset
-- **Structured Output**: Categorized errors, warnings, and info messages
-- **API Ready**: Simple string arrays for webhook payloads
-- **Type Safe**: Go's type system ensures safe field access
-- **JSON Log Parsing**: Handles structured JSON logs from Renovate containers
-- **Error Aggregation**: Counts duplicate errors and provides summaries
+The `ExtractUsefulError` function intelligently extracts the most useful parts of potentially long error messages. It's designed to reduce noise while preserving critical information and context.
+
+### How It Works
+
+1. **Preserves the first line**: Always keeps the initial error message for context
+2. **Identifies critical lines**: Uses regex patterns to detect important error lines (e.g., "Command failed:", "Error:", "FATAL:", "Caused by:", etc.)
+3. **Maintains context**: Keeps a rolling buffer of recent non-critical lines for context
+4. **Preserves the end**: Always includes the last few lines of the error message
+5. **Filters noise**: Skips empty lines and lines containing only symbols (like `~`, `^`, `=`)
+6. **Limits output**: Restricts output to a maximum number of lines (default: 8) to keep messages concise (it can be a little bit more, because of the last 3 lines being added after the max length check)
+
+### Example
+
+The function transforms verbose error messages into concise, actionable summaries. The images below demonstrate the transformation:
+
+**Before** - Full verbose error message with many lines of stack traces and context:
+
+![Before: Full error message](before.png)
+
+**After** - Same error after processing with `ExtractUsefulError`, highlighting only the critical parts:
+
+![After: Extracted useful error](after.png)
+
+The function is used automatically in the `rawExecError` check function to provide cleaner, more readable error messages in reports.
+
+### Usage
+
+```go
+// Extract error with default max lines (8)
+shortError := ExtractUsefulErrorDefault(fullErrorMessage)
+
+// Extract error with custom max lines
+shortError := ExtractUsefulError(fullErrorMessage, 10)
+```
 
 ## Data Models
 
@@ -152,16 +181,9 @@ type SimpleReport struct {
 
 ## Integration
 
-The package is designed for integration with Kubernetes controllers:
+The package is designed for integration with Kubernetes controllers and KITE API:
 
 1. Extract logs from failed pods using `GetFailedPodDetails()`
 2. The function automatically processes logs with both level-based and message-based approaches
 3. Return structured `PodDetails` for API consumption
 4. Send categorized results to webhooks or other systems
-
-## Error Handling
-
-- Non-JSON log lines are logged as "UNKNOWN" entries
-- Failed log parsing doesn't stop the overall process
-- Container log stream errors are logged but don't halt processing
-- Memory management includes buffer size limits for large logs
